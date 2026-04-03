@@ -38,6 +38,8 @@ section).
 
 ### Prior Art
 
+#### Crossplane Ecosystem
+
 - **[design-doc-smaller-providers.md][design-smaller-providers]**: Broke large
   providers into service-scoped packages to reduce CRD count. Documents
   upjet-based provider resource consumption characteristics. Complementary to
@@ -49,10 +51,83 @@ section).
 - **[one-pager-performance-characteristics-of-providers.md][one-pager-perf]**:
   Proposed tooling for measuring provider CPU utilization, memory utilization,
   and time-to-readiness for managed resources.
+- **[provider-terraform#270][provider-terraform-sharding]**: An open PR adding
+  label-based sharding to provider-terraform. Uses a `--shard-name` flag and
+  `terraform.crossplane.io/shard` label with `cache.ByObject` label selectors
+  for informer-level filtering. Nearly identical to this proposal, validating
+  the approach. Notably documents that garbage collection of local state (e.g.,
+  Terraform working directories) must list all resources globally — not just the
+  shard's resources — to avoid incorrectly deleting another shard's state.
+- **[provider-ansible#365][provider-ansible-sharding]**: A merged PR adding
+  sharding to provider-ansible using a different mechanism: lease-based shard
+  acquisition with FNV hash-based event filtering. Replicas acquire numbered
+  shards via Coordination leases, then use a predicate
+  (`hash(name) % totalShards == myShard`) to filter reconcile events. This
+  filters at the reconciler level (events reach the informer but are dropped by
+  predicates), which is less efficient than the informer-level filtering
+  proposed here and in provider-terraform#270.
+
+#### Kubernetes Ecosystem
+
+- **[kubernetes-controller-sharding][k8s-controller-sharding]**: A generic
+  framework (v0.13.0) for Kubernetes controller sharding. Uses a
+  `ControllerRing` CRD, a central "sharder" component that assigns objects to
+  shards via labels, lease-based shard membership, and a drain protocol for
+  safe rebalancing. See [Relationship to kubernetes-controller-sharding]
+  (#relationship-to-kubernetes-controller-sharding) for detailed analysis.
+- **[KusionStack controller-mesh][controller-mesh]**: A sidecar-proxy-based
+  approach to controller sharding. Injects a `ctrlmesh-proxy` container into
+  operator pods that intercepts API server connections and injects label
+  selectors into requests to enforce shard boundaries. Uses namespace-based
+  hash labels (`ctrlmesh.kusionstack.io/sharding-hash`, values 0-31) for
+  partitioning. The proxy-based approach is transparent to controllers but
+  adds operational complexity (sidecar injection, proxy management). The
+  project has not seen updates since mid-2024 (last release v0.2.0, July
+  2024).
 - **controller-runtime label selectors**: controller-runtime supports
   `cache.Options.DefaultLabelSelector` and per-GVK `cache.Options.ByObject`
   overrides, enabling filtered informer caches. This is the mechanism we
   build on.
+
+### Why Core Functionality
+
+provider-terraform#270 and provider-ansible#365 demonstrate that individual
+providers are already implementing sharding independently, each with different
+mechanisms:
+
+| Provider | Mechanism | Filter Level | Shard Assignment |
+|----------|-----------|-------------|------------------|
+| provider-ansible | FNV hash + lease | Predicate (reconciler) | Automatic (hash) |
+| provider-terraform | Label + cache selector | Informer (watch) | Manual (user labels) |
+
+This fragmentation has several costs:
+
+- **Duplicated effort**: Each provider reimplements sharding logic, including
+  subtle correctness concerns (e.g., the GC safety invariant in
+  provider-terraform#270 where shard-local GC must list all resources globally).
+- **Inconsistent UX**: Different label keys (`terraform.crossplane.io/shard`
+  vs a hash-based model), different CLI flags, different shard assignment models.
+  Operators managing multiple providers must learn multiple sharding schemes.
+- **No integration with Crossplane lifecycle**: Ad-hoc sharding requires
+  operators to manually create and manage shard Deployments outside of
+  Crossplane's package manager. Provider upgrades, RBAC, TLS certificates,
+  and webhook configuration must be duplicated manually for each shard.
+- **No label propagation**: Without core support, the `crossplane.io/shard`
+  label is not propagated from Claims/XRs to composed resources. Each provider
+  must independently handle shard assignment at the resource level rather than
+  the composition level.
+
+By making sharding a core Crossplane capability:
+
+1. **crossplane-runtime** provides the `--shard-id` flag and cache
+   configuration, so providers get sharding support without code changes.
+2. **Crossplane core** propagates the shard label through the composition
+   chain, so operators assign shards at the Claim/XR level — not per-resource.
+3. **DeploymentRuntimeConfig** manages shard Deployments, so provider
+   upgrades, RBAC, and TLS certificates are handled automatically for all
+   shards.
+4. A single, consistent label key (`crossplane.io/shard`) works across all
+   providers.
 
 ## Goals
 
@@ -471,6 +546,70 @@ ProviderConfigs. The per-GVK cache override (`cache.Options.ByObject`) exempts
 ProviderConfig types from the shard label selector, making them visible to all
 shard instances.
 
+### Relationship to kubernetes-controller-sharding
+
+The [kubernetes-controller-sharding][k8s-controller-sharding] project (v0.13.0)
+provides a generic framework for Kubernetes controller sharding. It introduces
+a `ControllerRing` CRD, a central "sharder" component that assigns objects to
+shards via labels, lease-based shard membership, and a drain protocol for safe
+rebalancing. We evaluated adopting it directly vs building Crossplane-native
+sharding.
+
+**What it would give us:**
+- Automatic shard assignment via a central sharder — no manual labeling.
+- A drain protocol for safe rebalancing: the sharder sets a drain label, the
+  current shard acknowledges by removing shard + drain labels, and the sharder
+  reassigns. This eliminates the brief window during relabeling where neither
+  shard is reconciling.
+- Lease-based membership: shards announce themselves via Leases, and the
+  sharder auto-detects new/dead shards. No need for explicit shard
+  configuration — just scale the Deployment replica count.
+
+**Why we chose not to adopt it directly:**
+
+1. **Composition hierarchy mismatch**: The sharder assigns labels to individual
+   objects. It does not understand Crossplane's Claim → XR → Composed Resource
+   hierarchy. If the sharder independently assigns composed resources to
+   different shards than their parent XR, a shard provider would see partial
+   compositions. Crossplane must propagate the shard label from XR to composed
+   resources itself, which means the sharder can only operate at the XR/Claim
+   level — requiring Crossplane-specific integration that negates much of the
+   "generic framework" benefit.
+
+2. **New cluster-scoped dependency**: Adopting it requires installing a
+   `ControllerRing` CRD and a sharder Deployment. This is a new component to
+   install, monitor, and upgrade alongside Crossplane. If the sharder goes
+   down, new resources are not assigned to shards (existing assignments are
+   sticky via labels, so reconciliation continues, but new resources are
+   unassigned).
+
+3. **Label key coupling**: The project uses
+   `shard.alpha.sharding.timebertt.dev/<ring-name>` as the label key.
+   Crossplane would either adopt this external label convention (coupling to a
+   third-party project's alpha API) or fork the label key (losing drop-in
+   compatibility).
+
+4. **Provider changes still required**: The sharder assigns labels, but
+   providers still need to filter their watches by that label. The
+   crossplane-runtime cache configuration changes are needed regardless.
+   Additionally, the drain protocol requires providers to check for the drain
+   label and acknowledge it — additional reconciler logic beyond simple cache
+   filtering.
+
+5. **DeploymentRuntimeConfig integration lost**: The sharder expects a single
+   Deployment scaled by replica count — each replica acquires its own shard
+   Lease. This is simpler but means Crossplane's package manager does not know
+   about individual shards. There would be no per-shard health status in
+   ProviderRevision and no safety checks on shard removal.
+
+**What we adopt from it:**
+
+The drain protocol is a valuable idea that we reference in [Future Work]
+(#future-work). If the project matures and stabilizes its API, Crossplane
+could consider adopting it as an optional sharder component for automatic shard
+assignment, while retaining the Crossplane-native label propagation and
+DeploymentRuntimeConfig integration.
+
 ## Implementation Scope
 
 ### crossplane core
@@ -503,12 +642,49 @@ shard instances.
 
 ## Future Work
 
+- **Drain protocol for safe rebalancing**: The
+  [kubernetes-controller-sharding][k8s-controller-sharding] project implements
+  a drain protocol where a sharder sets a drain label on resources being
+  reassigned, the current shard acknowledges by removing the shard and drain
+  labels, and the sharder then reassigns to the new shard. This prevents the
+  brief window during relabeling where neither shard is reconciling. Adopting
+  a similar protocol could improve rebalancing safety for long-running
+  reconciliations.
 - Webhook or admission policy for automatic shard assignment.
 - Shard load monitoring and rebalancing tooling.
 - Per-shard `deploymentTemplate` overrides (e.g., different resource limits
   per shard).
+- Optional integration with kubernetes-controller-sharding as an external
+  sharder component, if the project matures and stabilizes its API.
 
 ## Alternatives Considered
+
+### Hash-Based Sharding
+
+[provider-ansible#365][provider-ansible-sharding] implements sharding using FNV
+hash-based event filtering: each replica acquires a numbered shard via
+Coordination leases, then applies `hash(resource.name) % totalShards == myShard`
+as a predicate filter.
+
+This has some advantages:
+- No user-facing labels required; shard assignment is automatic.
+- Resources are distributed uniformly by name hash.
+
+We chose label-based sharding over this approach because:
+- Hash-based filtering operates at the predicate (reconciler) level, not the
+  informer level. Events for all resources still reach every replica's informer
+  cache, consuming memory and network bandwidth. Label-based filtering uses
+  `cache.Options.DefaultLabelSelector` which filters at the API server watch
+  level — only matching events are sent over the wire.
+- Hash-based assignment is opaque to operators. There is no way to inspect
+  which shard owns a resource without computing the hash. Labels are visible
+  via `kubectl get -l crossplane.io/shard=X`.
+- Rebalancing (adding/removing shards) with hash-based assignment requires
+  rehashing, which moves a large fraction of resources simultaneously.
+  Label-based assignment allows granular, operator-controlled migration.
+- Hash-based assignment cannot honor Crossplane's composition hierarchy.
+  Label-based assignment propagates from Claim → XR → composed resources,
+  ensuring all resources in a composition tree are co-located on one shard.
 
 ### Multiple Replicas with Leader Election per Resource
 
@@ -536,6 +712,25 @@ We rejected this because:
 - Composite resources may be cluster-scoped or namespaced.
 - Forcing namespace-based partitioning would require architectural changes to
   resource scoping.
+
+### Sidecar Proxy-Based Sharding
+
+[KusionStack controller-mesh][controller-mesh] takes a proxy-based approach:
+a sidecar container is injected into operator pods and intercepts API server
+connections, injecting label selectors into watch/list requests to enforce
+shard boundaries. This is transparent to the controller — no code changes
+required.
+
+We chose not to pursue this approach because:
+- It adds operational complexity (sidecar injection, proxy lifecycle
+  management, mTLS between proxy and API server).
+- It uses namespace-based hash partitioning (`sharding-hash` values 0-31),
+  which does not work for Crossplane's cluster-scoped managed resources.
+- The project has not seen updates since mid-2024 (last release v0.2.0),
+  raising concerns about long-term maintenance.
+- The proxy intercepts all API server traffic for the pod, not just sharded
+  resource types. This makes it harder to exempt non-sharded types
+  (ProviderConfig, Secrets) from the shard filter.
 
 ### Virtual Clusters (vcluster)
 
@@ -566,3 +761,7 @@ Changes in **crossplane-runtime** (separate repo):
 [design-smaller-providers]: design-doc-smaller-providers.md
 [one-pager-crd-scaling]: one-pager-crd-scaling.md
 [one-pager-perf]: one-pager-performance-characteristics-of-providers.md
+[provider-terraform-sharding]: https://github.com/crossplane-contrib/provider-terraform/pull/270
+[provider-ansible-sharding]: https://github.com/crossplane-contrib/provider-ansible/pull/365
+[k8s-controller-sharding]: https://github.com/timebertt/kubernetes-controller-sharding
+[controller-mesh]: https://github.com/KusionStack/controller-mesh
